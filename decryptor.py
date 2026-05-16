@@ -31,7 +31,7 @@ def read_var_length_block(f: BinaryIO, header: bool = False) -> Optional[bytes]:
         raise ValueError(
             f"Expected to read 4 bytes (length), actually read {len(length_bytes)} bytes while reading {block_type}")
 
-    length = int.from_bytes(length_bytes)
+    length = int.from_bytes(length_bytes, "big")
     if (length == 0 and header) or length > 0x10010:
         raise ValueError(f"Unexpected {block_type.capitalize()} length: {length}")
 
@@ -66,7 +66,7 @@ def decrypt_aes_gcm_blocks(key, blocks: Iterable[bytes]) -> Iterable[bytes]:
 
     for block in blocks:
         if len(block) > 0:
-            yield aes_gcm.decrypt(chunk_index.to_bytes(12), block, None)
+            yield aes_gcm.decrypt(chunk_index.to_bytes(12, "big"), block, None)
         chunk_index += 1
 
 
