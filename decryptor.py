@@ -125,11 +125,11 @@ def decrypt_file(enc_path: str, private_key: RSAPrivateKey) -> Iterable[bytes]:
         header = decrypt_rsa_header(private_key, encrypted_header)
 
         if fmt == "java" and len(header) == 0x20:
-            return decrypt_aes_cfb_blocks(
+            yield from decrypt_aes_cfb_blocks(
                 header[16:32], header[:16],
                 read_blocks(f, lambda fp: read_fixed_length_block(fp, 64 * 1024)))
         elif fmt in ("golang", "csharp", "rust") and len(header) >= 0x20:
-            return decrypt_aes_gcm_blocks(
+            yield from decrypt_aes_gcm_blocks(
                 header[:32],
                 read_blocks(f, read_var_length_block))
         else:
