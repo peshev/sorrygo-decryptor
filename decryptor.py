@@ -4,6 +4,7 @@ import argparse
 import os
 from pathlib import Path
 from typing import Iterable, Callable, BinaryIO, Tuple, Optional, Union
+from smart_open import open
 
 import tqdm
 from cryptography.hazmat.primitives import serialization
@@ -154,7 +155,11 @@ def find_encrypted_files(dir_path: str, output_dir_path: str = None, extension: 
         -> Iterable[Tuple[str, str]]:
     for root, dirs, files in os.walk(dir_path):
         if output_dir_path is not None:
-            output_path = os.path.join(output_dir_path, os.path.relpath(root, dir_path))
+            relpath = os.path.relpath(root, dir_path)
+            if relpath != ".":
+                output_path = os.path.join(output_dir_path, relpath)
+            else:
+                output_path = output_dir_path
         else:
             output_path = root
         for file in files:
@@ -174,7 +179,7 @@ def main():
     private_key = load_private_key(args.key, password=args.password)
 
     if os.path.isdir(args.encrypted_file):
-        if args.output is not None:
+        if args.output is not None and not args.output.startswith("s3:"):
             if os.path.exists(args.output) and not os.path.isdir(args.output):
                 raise ValueError(f"{args.output} exists but it's not a directory")
             else:
@@ -189,7 +194,14 @@ def main():
                 print(e.args[0])
     elif os.path.isfile(args.encrypted_file):
         try:
-            output_file_path = decrypt_to_file(args.encrypted_file, private_key, args.output)
+            if args.output.endswith("/") or os.path.isdir(args.output):
+                output_path = args.output
+                if not output_path.endswith("/"):
+                    output_path += "/"
+                output_path += default_output_path(os.path.basename(args.encrypted_file))
+            else:
+                output_path = args.output
+            output_file_path = decrypt_to_file(args.encrypted_file, private_key, output_path)
             print(f"Wrote decrypted file to {output_file_path}")
         except FileExistsError as e:
             print(e.args[0])

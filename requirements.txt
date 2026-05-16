@@ -1,2 +1,3 @@
 cryptography
 tqdm
+smart_open[s3]
