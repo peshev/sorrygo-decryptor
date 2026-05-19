@@ -22,8 +22,7 @@ from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-import multitqdm
-from multitqdm import ProgressBar, ProgressBarExecutor
+from multitqdm import ProgressBar, ProgressBarExecutor, SimpleProgressBar
 
 MAGIC = {
     0x66: "java",
@@ -142,8 +141,12 @@ def decrypt_rsa_header(private_key: RSAPrivateKey, enc_header: bytes) -> bytes:
     )
 
 
-def decrypt_to_file(progressbar: ProgressBar, enc_path: str, private_key: RSAPrivateKey, out_path: str):
-    write_blocks(out_path, decrypt_file(progressbar, enc_path, private_key))
+def decrypt_to_file(progressbar: ProgressBar, enc_path: str, private_key: RSAPrivateKey, output_path: str, dest_fs: FilesystemInterface):
+        if dest_fs.exists(output_path):
+            print(f"Output file {output_path} exists. Not decrypting.")
+            progressbar.complete()
+        else:
+            write_blocks(output_path, decrypt_file(progressbar, enc_path, private_key))
 
 
 def read_header(f):
@@ -299,13 +302,11 @@ def main():
                                  total_completed=True,
                                  total=len(encrypted_files),
                                  desc="Decrypting files") as executor:
-            futures = []
-            for encrypted_file, output_path in encrypted_files:
-                if not dest_fs.exists(output_path):
-                    futures.append(executor.submit(decrypt_to_file, encrypted_file, private_key, output_path))
-                else:
-                    print(f"Decrypted file {output_path} exists. Not decrypting.")
-            for future in concurrent.futures.as_completed(futures):
+            for future in concurrent.futures.as_completed([
+                executor.submit(decrypt_to_file, encrypted_file, private_key, output_path, dest_fs)
+                for encrypted_file, output_path in
+                encrypted_files
+            ]):
                 future.result()
     elif src_fs.isfile(args.encrypted_file):
         if args.output and (args.output.endswith("/") or dest_fs.isdir(args.output)):
@@ -317,10 +318,7 @@ def main():
             output_path = args.output
         if output_path is None:
             output_path = default_output_path(args.encrypted_file)
-        if dest_fs.exists(output_path):
-            print(f"Decrypted file {output_path} exists. Not decrypting.")
-        else:
-            decrypt_to_file(multitqdm.SimpleProgressBar(), args.encrypted_file, private_key, output_path)
+        decrypt_to_file(SimpleProgressBar(), args.encrypted_file, private_key, output_path, dest_fs)
 
 
 if __name__ == "__main__":
