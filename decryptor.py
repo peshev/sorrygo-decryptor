@@ -3,187 +3,60 @@
 import argparse
 import concurrent
 import os
-import urllib
-from asyncio import as_completed
 from concurrent.futures import ThreadPoolExecutor
-from io import SEEK_CUR, SEEK_SET
-from pathlib import Path
-from typing import Iterable, Callable, BinaryIO, Tuple, Optional, Union
-import urllib.parse
+from typing import Iterable, Tuple, Optional, List
 
-import boto3
-from botocore.exceptions import ClientError
-from smart_open import open
-
+# noinspection PyPackageRequirements
 import tqdm
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import padding
-from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+# noinspection PyUnresolvedReferences
 from multitqdm import ProgressBar, ProgressBarExecutor, SimpleProgressBar
-
-MAGIC = {
-    0x66: "java",
-    0xFF: "csharp",
-    0x99: "golang",
-    0x11: "rust",
-}
+from utils import FilesystemInterface, write_blocks, LocalFilesystemInterface, S3FilesystemInterface, Decryptor
+from sorrygo import SorryGoDecryptor
 
 
-def get_aes_gcm_ciphertext_size(f: BinaryIO) -> int:
-    restore_pos = f.tell()
-    plaintext_size = 0
-    while True:
-        length_bytes = f.read(4)
-        if len(length_bytes) == 0:
-            break
-        if len(length_bytes) != 4:
-            raise ValueError(
-                f"Expected to read 4 bytes (length), actually read {len(length_bytes)} bytes while calculating plaintext size")
+class EncryptedFile(object):
+    def __init__(self, decryptor: Decryptor, encrypted_path: str, decrypted_path: str,
+                 src_fs: FilesystemInterface, dest_fs: FilesystemInterface):
+        self.decryptor = decryptor
+        self.encrypted_path = encrypted_path
+        self.decrypted_path = decrypted_path
+        self.dest_fs = dest_fs
+        self.src_fs = src_fs
+        self._encrypted_file_size = None
+        self._decrypted_file_size = None
 
-        length = int.from_bytes(length_bytes, "big")
-        if length > 0x10010:
-            raise ValueError(f"Unexpected block length: {length}")
-        if length == 0:
-            break
+    def encrypted_file_size(self, force: bool = False) -> int:
+        if self._encrypted_file_size is None or force:
+            self._encrypted_file_size = self.src_fs.getsize(self.encrypted_path)
+        return self._encrypted_file_size
 
-        plaintext_size += length
-        f.seek(length, SEEK_CUR)
+    def decrypted_file_size(self, force: bool = False) -> int:
+        if self._decrypted_file_size is None or force:
+            self._decrypted_file_size = self.dest_fs.getsize(self.decrypted_path)
+        return self._decrypted_file_size
 
-    f.seek(restore_pos, SEEK_SET)
-    return plaintext_size
+    def estimate_plaintext_size(self):
+        return self.decryptor.estimate_plaintext_size(self.encrypted_file_size())
 
+    def is_decrypted(self) -> bool:
+        try:
+            return self.decrypted_file_size(True) == self.estimate_plaintext_size()
+        except FileNotFoundError:
+            return False
 
-def read_var_length_block(f: BinaryIO, header: bool = False) -> Optional[bytes]:
-    block_type = "header" if header else "block"
-    length_bytes = f.read(4)
-    if len(length_bytes) == 0 and not header:
-        # clean EOF while trying to read the length of a new block is ok (although in practice, all files end with a zero-length block, so this should never happen)
-        return None
-    if len(length_bytes) != 4:
-        # EOF while trying to read the header length, or some garbage at the end of the file is not ok
-        raise ValueError(
-            f"Expected to read 4 bytes (length), actually read {len(length_bytes)} bytes while reading {block_type}")
-
-    length = int.from_bytes(length_bytes, "big")
-    if (length == 0 and header) or length > 0x10010:
-        raise ValueError(f"Unexpected {block_type.capitalize()} length: {length}")
-
-    data = f.read(length)
-    if len(data) != length:
-        raise ValueError(
-            f"Expected to read {length} bytes (data), actually read {len(data)} bytes while reading {block_type}")
-
-    return data
-
-
-def read_fixed_length_block(f: BinaryIO, length: int) -> Optional[bytes]:
-    if length == 0:
-        return b""
-    data = f.read(length)
-    if len(data) == 0:
-        return None
-    return data
-
-
-def read_blocks(f: BinaryIO, read_block_fn: Callable[[BinaryIO], Optional[bytes]]) -> Iterable[bytes]:
-    while True:
-        block = read_block_fn(f)
-        if block is None:
-            return
-        yield block
-
-
-def decrypt_aes_gcm_blocks(key, blocks: Iterable[bytes]) -> Iterable[bytes]:
-    aes_gcm = AESGCM(key)
-    chunk_index = 0
-
-    for block in blocks:
-        if len(block) > 0:
-            yield aes_gcm.decrypt(chunk_index.to_bytes(12, "big"), block, None)
-        chunk_index += 1
-
-
-def decrypt_aes_cfb_blocks(key, iv, blocks: Iterable[bytes]) -> Iterable[bytes]:
-    aes_cfb = Cipher(algorithms.AES(key), modes.CFB(iv))
-    decryptor = aes_cfb.decryptor()
-
-    for block in blocks:
-        yield decryptor.update(block)
-    yield decryptor.finalize()
-
-
-def progress_blocks(progressbar: ProgressBar, blocks: Iterable[bytes]) -> Iterable[bytes]:
-    for block in blocks:
-        progressbar.progress(len(block))
-        yield block
-
-
-def write_blocks(path: str, blocks: Iterable[bytes]):
-    with open(path, "wb") as f:
-        for block in blocks:
-            f.write(block)
-
-
-def decrypt_rsa_header(private_key: RSAPrivateKey, enc_header: bytes) -> bytes:
-    key_size = private_key.key_size // 8
-    if len(enc_header) % key_size != 0:
-        raise ValueError(
-            "RSA header size is not a multiple of the private key size: "
-            f"header={len(enc_header)} bytes, key={key_size} bytes"
-        )
-    return b"".join(
-        private_key.decrypt(enc_header[offset: offset + key_size], padding.PKCS1v15())
-        for offset in
-        range(0, len(enc_header), key_size)
-    )
-
-
-def decrypt_to_file(progressbar: ProgressBar, enc_path: str, private_key: RSAPrivateKey, output_path: str, dest_fs: FilesystemInterface):
-        if dest_fs.exists(output_path):
-            print(f"Output file {output_path} exists. Not decrypting.")
-            progressbar.complete()
+    def delete(self, force=False):
+        if self.is_decrypted() or force:
+            self.src_fs.unlink(self.encrypted_path)
+            return True
         else:
-            write_blocks(output_path, decrypt_file(progressbar, enc_path, private_key))
+            return False
 
+    def _decrypt_blocks(self, progressbar: ProgressBar):
+        return self.decryptor.decrypt(progressbar, self.encrypted_path, self.encrypted_file_size())
 
-def read_header(f):
-    magic_byte = f.read(1)
-    if len(magic_byte) != 1:
-        raise ValueError(f"Encrypted file is empty")
-
-    fmt = MAGIC.get(magic_byte[0], "unknown")
-    if fmt == "unknown":
-        raise ValueError(f"Unknown magic byte: 0x{magic_byte:02x}")
-
-    _ = read_var_length_block(f, header=True)  # TODO: What's in this first header?
-
-    encrypted_header = read_var_length_block(f, header=True)
-    assert encrypted_header is not None
-    return fmt, encrypted_header
-
-
-def decrypt_file(progressbar: ProgressBar, enc_path: str, private_key: RSAPrivateKey) -> Iterable[
-    bytes]:
-    with open(enc_path, "rb") as f:
-        fmt, encrypted_header = read_header(f)
-        header = decrypt_rsa_header(private_key, encrypted_header)
-
-        if fmt == "java" and len(header) == 0x20:
-            yield from decrypt_aes_cfb_blocks(
-                header[16:32], header[:16],
-                read_blocks(f, lambda fp: read_fixed_length_block(fp, 64 * 1024)))
-        elif fmt in ("golang", "csharp", "rust") and len(header) >= 0x20:
-            plaintext_size = get_aes_gcm_ciphertext_size(f)
-            progressbar.start(desc=enc_path, total=plaintext_size, unit="B", unit_scale=True)
-            yield from decrypt_aes_gcm_blocks(header[:32],
-                                              progress_blocks(progressbar,
-                                                              read_blocks(f, read_var_length_block)))
-            progressbar.complete()
-        else:
-            raise ValueError(f"Unknown decrypt format {fmt} or incorrect header length ({len(header)} bytes)")
+    def decrypt(self, progressbar: ProgressBar):
+        return write_blocks(self.decrypted_path, self._decrypt_blocks(progressbar))
 
 
 def default_output_path(path: str, strip_suffix: str = ".sorry") -> str:
@@ -192,15 +65,7 @@ def default_output_path(path: str, strip_suffix: str = ".sorry") -> str:
     return path + ".dec"
 
 
-def load_private_key(path, password: Optional[Union[str, bytes]] = None) -> RSAPrivateKey:
-    if isinstance(password, str):
-        password = password.encode()
-    private_key = serialization.load_pem_private_key(Path(path).read_bytes(), password=password)
-    assert isinstance(private_key, RSAPrivateKey)
-    return private_key
-
-
-def find_encrypted_files(dir_path: str, output_dir_path: str = None, extension: str = ".sorry") \
+def find_encrypted_files(dir_path: str, output_dir_path: Optional[str] = None, extension: str = ".sorry") \
         -> Iterable[Tuple[str, str]]:
     for root, dirs, files in os.walk(dir_path):
         if output_dir_path is not None:
@@ -217,109 +82,147 @@ def find_encrypted_files(dir_path: str, output_dir_path: str = None, extension: 
                 yield file_path, default_output_path(os.path.join(output_path, file), extension)
 
 
-class FilesystemInterface(object):
-    def exists(self, path: str) -> bool:
-        raise NotImplementedError
-
-    def isfile(self, path: str) -> bool:
-        raise NotImplementedError
-
-    def isdir(self, path: str) -> bool:
-        raise NotImplementedError
-
-    def makedirs(self, path: str, exists_ok: bool = True) -> None:
-        raise NotImplementedError
+def assert_directory(path: str, fs: FilesystemInterface):
+    if path is not None:
+        if fs.exists(path):
+            if not fs.isdir(path):
+                raise ValueError(f"{path} exists but it's not a directory")
+        else:
+            fs.makedirs(path)
 
 
-class LocalFilesystemInterface(FilesystemInterface):
+class EncryptedFilePreProcessor(object):
+    def __init__(self, delete: bool = False):
+        self.encrypted_files = []
+        self.exceptions = []
+        self.encrypted_files_total_size = 0
+        self.delete = delete
 
-    def exists(self, path: str) -> bool:
-        return os.path.exists(path)
-
-    def isfile(self, path: str) -> bool:
-        return os.path.isfile(path)
-
-    def isdir(self, path: str) -> bool:
-        return os.path.isdir(path)
-
-    def makedirs(self, path: str, exist_ok: bool = True) -> None:
-        os.makedirs(path, exist_ok)
-
-
-class S3FilesystemInterface(FilesystemInterface):
-    def __init__(self):
-        self.client = boto3.client("s3")
-
-    def exists(self, path: str) -> bool:
-        parsed = urllib.parse.urlparse(path)
-        assert parsed.scheme == "s3"
-        return bool(self.client.list_objects_v2(Bucket=parsed.hostname, Prefix=parsed.path.lstrip("/")).get("Contents"))
-
-    def isfile(self, path: str) -> bool:
-        parsed = urllib.parse.urlparse(path)
-        assert parsed.scheme == "s3"
+    def __call__(self, encrypted_file: EncryptedFile):
         try:
-            self.client.head_object(Bucket=parsed.hostname, Key=parsed.path.lstrip("/"))
-            return True
-        except ClientError as e:
-            if e.response["Error"]["Code"] == "404":
-                return False
+            if encrypted_file.is_decrypted():
+                if self.delete:
+                    encrypted_file.delete()
             else:
-                raise e
+                self.encrypted_files_total_size += encrypted_file.encrypted_file_size()
+                self.encrypted_files.append(encrypted_file)
+        except Exception as e:
+            self.exceptions.append((e, encrypted_file))
 
-    def isdir(self, path: str) -> bool:
-        return self.exists(path) and not self.isfile(path)
+    def print_summary(self):
+        for e, ef in self.exceptions:
+            print(f"Exception while processing {ef.encrypted_path}: {e}")
 
-    def makedirs(self, path: str, exists_ok: bool = True) -> None:
-        pass
+
+class EncryptedFileProcessor(object):
+    def __init__(self, delete: bool = False):
+        self.exceptions: List[Tuple[Exception, EncryptedFile]] = []
+        self.delete = delete
+
+    def __call__(self, progressbar: ProgressBar, encrypted_file: EncryptedFile):
+        try:
+            decrypted_plaintext_size = encrypted_file.decrypt(progressbar)
+            assert decrypted_plaintext_size == encrypted_file.estimate_plaintext_size(), (
+                f"Unable to correctly estimate the plaintext size for {encrypted_file.encrypted_path}. "
+                f"Expected {encrypted_file.estimate_plaintext_size()}, "
+                f"but got {decrypted_plaintext_size}"
+            )
+            assert encrypted_file.is_decrypted(), (
+                f"Unexpected plaintext file size for {encrypted_file.encrypted_path}. "
+                f"Expected {encrypted_file.estimate_plaintext_size()}, "
+                f"but got {encrypted_file.decrypted_file_size()}")
+            if self.delete:
+                encrypted_file.delete()
+        except Exception as e:
+            self.exceptions.append((e, encrypted_file))
+
+    def print_summary(self):
+        for e, ef in self.exceptions:
+            print(f"Exception while processing {ef.encrypted_path}: {e}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Decrypt .sorry files")
-    parser.add_argument("encrypted_file")
-    parser.add_argument("-k", "--key", default="private.pem", help="private key PEM path")
+    parser.add_argument("encrypted_file", nargs="+")
+    parser.add_argument("-k", "--key", help="private key PEM path",
+                        default="private.pem")
     parser.add_argument("-o", "--output", help="output path")
     parser.add_argument("--password", help="private key passphrase")
-    parser.add_argument("-w", "--workers", help="parallel workers to decrypt with", default=4, type=int)
+    parser.add_argument("-w", "--workers", help="parallel workers to decrypt with",
+                        default=4, type=int)
+    parser.add_argument("-d", "--delete", help="Delete encrypted files after successful encryption",
+                        action="store_true")
     args = parser.parse_args()
+    decryptor = SorryGoDecryptor(args.key, args.password)
 
-    private_key = load_private_key(args.key, password=args.password)
     src_fs = LocalFilesystemInterface()
     if args.output and args.output.startswith("s3://"):
         dest_fs = S3FilesystemInterface()
     else:
         dest_fs = LocalFilesystemInterface()
 
-    if src_fs.isdir(args.encrypted_file):
-        if args.output is not None and not args.output.startswith("s3:"):
-            if dest_fs.exists(args.output) and not dest_fs.isdir(args.output):
-                raise ValueError(f"{args.output} exists but it's not a directory")
-            else:
-                dest_fs.makedirs(args.output)
-        encrypted_files = list(tqdm.tqdm(find_encrypted_files(args.encrypted_file, args.output),
-                                         desc=f"Enumerating encrypted files in {args.encrypted_file}"))
+    if args.output and (args.output.endswith("/") or dest_fs.isdir(args.output)):
+        output_path = args.output
+        if not output_path.endswith("/"):
+            output_path += "/"
+    else:
+        output_path = args.output
+
+    # Step 1: Find files that have the encrypted file extension
+    found_encrypted_files = []
+    for encfile in args.encrypted_file:
+        if src_fs.isdir(encfile):
+            assert_directory(output_path, dest_fs)
+            found_encrypted_files.extend(find_encrypted_files(encfile, output_path))
+        elif src_fs.isfile(encfile):
+            if len(args.encrypted_files) > 1:
+                assert_directory(output_path, dest_fs)
+                if output_path is not None:
+                    output_path += default_output_path(os.path.basename(encfile))
+            if output_path is None:
+                output_path = default_output_path(encfile)
+            found_encrypted_files.append((encfile, output_path))
+
+    encrypted_files = [
+        EncryptedFile(decryptor, encrypted_path, decrypted_path, src_fs, dest_fs)
+        for encrypted_path, decrypted_path in
+        found_encrypted_files
+    ]
+
+    # Step 2: Figure out which of these files have already been decrypted, optionally delete the encrypted versions
+    # of already decrypted files, and collect the size of all files to be decrypted
+    preprocessor = EncryptedFilePreProcessor(args.delete)
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        for future in tqdm.tqdm(
+                concurrent.futures.as_completed(
+                    executor.submit(preprocessor, encrypted_file)
+                    for encrypted_file in
+                    encrypted_files
+                ),
+                desc=f"Calculating size of encrypted files in {args.encrypted_file}",
+                total=len(encrypted_files)):
+            future.result()
+    preprocessor.print_summary()
+
+    # Step 3: If any files that need to be decrypted have been identified, decrypt and optionally delete them
+    # after verifying that they've successfully been decrypted
+    if preprocessor.encrypted_files:
+        processor = EncryptedFileProcessor(delete=args.delete)
         with ProgressBarExecutor(ThreadPoolExecutor(max_workers=args.workers),
-                                 total_completed=True,
-                                 total=len(encrypted_files),
-                                 desc="Decrypting files") as executor:
-            for future in concurrent.futures.as_completed([
-                executor.submit(decrypt_to_file, encrypted_file, private_key, output_path, dest_fs)
-                for encrypted_file, output_path in
-                encrypted_files
-            ]):
+                                 desc="Decrypting files",
+                                 total=preprocessor.encrypted_files_total_size, unit="B",
+                                 unit_scale=True) as executor:
+            for future in concurrent.futures.as_completed(
+                    executor.submit(processor, encrypted_file)
+                    for encrypted_file in
+                    preprocessor.encrypted_files
+            ):
                 future.result()
-    elif src_fs.isfile(args.encrypted_file):
-        if args.output and (args.output.endswith("/") or dest_fs.isdir(args.output)):
-            output_path = args.output
-            if not output_path.endswith("/"):
-                output_path += "/"
-            output_path += default_output_path(os.path.basename(args.encrypted_file))
-        else:
-            output_path = args.output
-        if output_path is None:
-            output_path = default_output_path(args.encrypted_file)
-        decrypt_to_file(SimpleProgressBar(), args.encrypted_file, private_key, output_path, dest_fs)
+        processor.print_summary()
+    else:
+        print("All files were already decrypted.")
 
 
 if __name__ == "__main__":
     main()
+    pass
